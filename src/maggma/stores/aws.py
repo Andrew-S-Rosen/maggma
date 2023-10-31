@@ -4,9 +4,11 @@ import warnings
 import zlib
 from concurrent.futures import wait
 from concurrent.futures.thread import ThreadPoolExecutor
+from datetime import datetime
 from hashlib import sha1
 from io import BytesIO
-from json import dumps
+from gzip import GzipFile
+from json import dumps, loads
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import msgpack  # type: ignore
@@ -24,7 +26,20 @@ except (ImportError, ModuleNotFoundError):
     boto3 = None  # type: ignore
 
 
-class S3Store(Store):
+# class S3Store:
+#     def __init__(self, use_MongoS3=True, **kwargs):
+#         self.instance = MongoS3Store(**kwargs) if use_MongoS3 else PureS3Store(**kwargs)
+#
+#     def __getattr__(self, name):
+#         return self.instance.__getattribute__(name)
+#
+
+
+def S3Store(*args, use_mongo=True, **kwargs):
+    return MongoS3Store(*args, **kwargs) if use_mongo else PureS3Store(*args, **kwargs)
+
+
+class MongoS3Store(Store):
     """
     GridFS like storage using Amazon S3 and a regular store for indexing
     Assumes Amazon AWS key and secret key are set in environment or default config file.
@@ -501,3 +516,154 @@ class S3Store(Store):
 
         fields = ["index", "bucket", "last_updated_field"]
         return all(getattr(self, f) == getattr(other, f) for f in fields)
+
+
+class PureS3Store(Store):
+    def __init__(
+        self,
+        bucket: str,
+        prefix: str,
+        document_key: str,
+        object_file_extension: str = ".json.gz",
+        s3_session_kwargs: Optional[dict] = None,
+        manifest_key: str = "manifest.json",
+        **kwargs,
+    ):
+        self.bucket = bucket
+        self.prefix = prefix
+        self.document_key = document_key
+        self.object_file_extension = object_file_extension
+        self.client: Any = None
+        self.session: Any = None
+        self.s3_session_kwargs = s3_session_kwargs if s3_session_kwargs else {}
+        self.manifest: List = []
+        self.manifest_key = manifest_key
+
+        super().__init__(**kwargs)
+
+    def _collection(self):
+        return NotImplementedError
+
+    @property
+    def name(self) -> str:
+        return f"s3://{self.bucket}/{self.prefix}"
+
+    def connect(self, *args, **kwargs):
+        if not self.session:
+            self.session = Session(**self.s3_session_kwargs)
+
+        self.client = self.session.client("s3")
+
+        try:
+            self.client.head_bucket(Bucket=self.bucket)
+        except ClientError:
+            raise RuntimeError(f"Bucket not present on AWS: {self.bucket}")
+
+    def close(self):
+        self.client.close()
+        self.client = None
+
+    def count(self, criteria: Optional[Dict] = None) -> int:
+        return len(self.manifest)
+
+    def query(self) -> Iterator[Dict]:
+        if not self.manifest:
+            self.get_manifest()
+
+        docs = []
+        for entry in self.manifest:
+            try:
+                response = self.client.get_object(Bucket=self.bucket, Key=f"{self.prefix}/{entry['key']}")
+
+            except ClientError as e:
+                error_code = e.response["Error"]["Code"]
+                if error_code in ["NoSuchKey", "NoSuchBucket"]:
+                    error_message = e.response["Error"]["Message"]
+                    self.logger.error(
+                        f"S3 returned '{error_message}' while querying '{self.bucket}/{self.prefix}' for '{entry['key']}'"
+                    )
+                    continue
+                else:
+                    raise e
+
+            docs.append(self.decompress_doc(response["Body"]))
+
+        return docs
+
+    def update(self, docs: Union[List[Dict], Dict], key: Union[List, str, None] = None):
+        for doc in docs:
+            entry_key = doc[key]
+            gzipped = self.compress_doc(doc)
+
+            try:
+                self.client.upload_fileobj(
+                    gzipped,
+                    self.bucket,
+                    f"{self.prefix}/{entry_key}{self.object_file_extension}",
+                )
+            except ClientError as e:
+                pass
+
+            self.update_manifest(
+                key=entry_key, properties={"last_updated": doc["last_updated"], "deprecated": doc["deprecated"]}
+            )
+
+    def ensure_index(self, key: str, unique: bool = False) -> bool:
+        return NotImplementedError
+
+    def groupby(self):
+        return NotImplementedError
+
+    def remove_docs(self, criteria: Dict):
+        return NotImplementedError
+
+    def query_one(self):
+        return NotImplementedError
+
+    def distinct(self):
+        return [entry.strip(self.object_file_extension) for entry in self.manifest]
+
+    def last_updated(self) -> datetime:
+        return NotImplementedError
+
+    def newer_in(self):
+        return NotImplementedError
+
+    def get_manifest(self):
+        response = self.client.get_object(Bucket=self.bucket, Key=f"{self.prefix}/{self.manifest_key}")
+        self.manifest = loads(response["Body"].read().decode("utf-8"))
+
+    def update_manifest(self, key, properties):
+        self.manifest.append(
+            {
+                "key": f"{key}.json.gz",
+                "properties": properties,
+            }
+        )
+
+    def upload_manifest(self):
+        try:
+            self.client.put_object(
+                Bucket=self.bucket,
+                Body=dumps(self.manifest),
+                Key=f"{self.prefix}/manifest.json",
+            )
+        except ClientError as e:
+            pass
+
+    def compress_doc(self, doc):
+        compressed_doc = BytesIO()
+
+        with GzipFile(fileobj=compressed_doc, mode="w") as gzipfile:
+            gzipfile.write(dumps(doc).encode("utf-8"))
+
+        compressed_doc.seek(0)
+
+        return compressed_doc
+
+    def decompress_doc(self, compressed_doc):
+        with GzipFile(fileobj=compressed_doc, mode="rb") as byte_stream:
+            byte_stream.seek(0)
+            doc = loads(byte_stream.read().decode("utf-8"))
+
+        return doc
