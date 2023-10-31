@@ -2,6 +2,7 @@ from enum import Enum
 from random import choice, randint
 from typing import Any, Tuple
 from urllib.parse import urlencode
+import json
 
 import pytest
 from fastapi.encoders import jsonable_encoder
@@ -87,7 +88,7 @@ def search_helper(payload, base: str = "/?", debug=True) -> Tuple[Response, Any]
     """
     owner_store = MemoryStore("owners", key="name")
     owner_store.connect()
-    owner_store.update([d.dict() for d in owners])
+    owner_store.update([d.model_dump() for d in owners])
 
     pets_store = MemoryStore("pets", key="name")
     pets_store.connect()
@@ -129,8 +130,8 @@ def search_helper(payload, base: str = "/?", debug=True) -> Tuple[Response, Any]
     res = client.get(url)
     try:
         data = res.json().get("data", [])
-    except Exception:
-        data = res.reason
+    except json.decoder.JSONDecodeError:
+        data = res.text
 
     return res, data
 
