@@ -86,7 +86,7 @@ class MapBuilder(Builder, metaclass=ABCMeta):
         """
         self.logger.info(f"Starting {self.__class__.__name__} Builder")
 
-        self.ensure_indexes()
+        # self.ensure_indexes()
 
         keys = self.target.newer_in(self.source, criteria=self.query, exhaustive=True)
         if self.retry_failed:
@@ -96,6 +96,9 @@ class MapBuilder(Builder, metaclass=ABCMeta):
                 failed_query = {"state": "failed"}
             failed_keys = self.target.distinct(self.target.key, criteria=failed_query)
             keys = list(set(keys + failed_keys))
+
+        # keys = list(key[self.source.key] for key in list(keys)[:10])
+        keys = [key[self.source.key] for key in list(keys)]
 
         self.logger.info(f"Processing {len(keys)} items")
 
@@ -112,7 +115,8 @@ class MapBuilder(Builder, metaclass=ABCMeta):
 
         all_docs = list(
             self.source.query(
-                criteria={self.source.key: {"$in": mats}},
+                # criteria={self.source.key: {"$in": mats}},
+                criteria={"is_in": (self.source.key, mats)},
                 properties=projection,
             )
         )
@@ -131,7 +135,7 @@ class MapBuilder(Builder, metaclass=ABCMeta):
             if not item:
                 continue
 
-            self.logger.debug(f"Processing: {item[self.source.key]}")
+            # self.logger.debug(f"Processing: {item[self.source.key]}")
 
             time_start = time()
 
@@ -180,8 +184,9 @@ class MapBuilder(Builder, metaclass=ABCMeta):
                 del item["_id"]
 
         if len(items) > 0:
-            self.target.update(items)
+            docs = self.target.update(items)
 
+        return docs
         self.target.close()
 
     def finalize(self):

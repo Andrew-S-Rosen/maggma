@@ -10,6 +10,7 @@ from botocore import UNSIGNED
 from botocore.config import Config
 from botocore.exceptions import ClientError
 from bson import json_util
+from pydash import get
 
 from maggma.core.store import Sort, Store
 from maggma.stores.aws import S3Store
@@ -94,11 +95,17 @@ class PandasMemoryStore(Store):
         skip: int = 0,
         limit: int = 0,
     ) -> pd.DataFrame:
-        query_string = ""
-        if criteria and "query" not in criteria:
+        query_string, is_in_key, is_in_list = "", None, None
+        if criteria and "query" not in criteria and "is_in" not in criteria:
             raise AttributeError("Pandas memory store cannot handle PyMongo filters")
+        if criteria and "query" in criteria and "is_in" in criteria:
+            raise AttributeError("Pandas memory store cannot mix query and is_in; please just use one or the other")
         if criteria:
-            query_string = criteria["query"]
+            if "is_in" in criteria:
+                is_in_key, is_in_list = criteria["is_in"]
+                query_string = None
+            elif "query" in criteria:
+                query_string = criteria["query"]
 
         if isinstance(properties, dict):
             properties = [key for key, value in properties.items() if value == 1]
@@ -110,6 +117,8 @@ class PandasMemoryStore(Store):
 
         if query_string:
             ret = ret.query(query_string)
+        elif is_in_key is not None:
+            ret = ret[ret[is_in_key].isin(is_in_list)]
 
         if properties:
             ret = ret[properties]
@@ -222,6 +231,9 @@ class PandasMemoryStore(Store):
             AttributeError: if the key and last updated fields are not both present in this store or
                 if criteria is provided when exhaustive is not set to True
         """
+        if self._data is None:
+            return target.query()
+
         if not (self._field_exists(self.key) and self._field_exists(self.last_updated_field)):
             raise AttributeError("This index store does not contain data with both key and last updated fields")
 
@@ -265,7 +277,8 @@ class PandasMemoryStore(Store):
         """
         criteria = criteria or {}
 
-        return [key for key, _ in self.groupby(field, properties=[field], criteria=criteria)]
+        ret = self._query(criteria=criteria, properties=[field])
+        return list(ret[field].unique())
 
     def groupby(
         self,
@@ -380,12 +393,9 @@ class S3IndexStore(PandasMemoryStore):
         try:
             response = self.client.get_object(Bucket=self.bucket, Key=self._get_full_key_path())
             df = pd.read_json(response["Body"], orient="records", lines=True)
-            if self.last_updated_field in df.columns:
-                df[self.last_updated_field] = df[self.last_updated_field].apply(
-                    lambda x: datetime.fromisoformat(x["$date"].rstrip("Z"))
-                    if isinstance(x, dict) and "$date" in x
-                    else x
-                )
+            df = df.applymap(
+                lambda x: datetime.fromisoformat(x["$date"].rstrip("Z")) if isinstance(x, dict) and "$date" in x else x
+            )
             return df
 
         except ClientError as ex:
@@ -552,23 +562,42 @@ class OpenDataStore(S3Store):
         ):
             group_doc = None  # S3 backed group doc
             for _, doc in docs.iterrows():
-                data = doc
+                data = [doc]
                 if properties is None or not prop_keys.issubset(set(doc.keys())):
-                    if not group_doc:
+                    if group_doc is None:
                         group_doc = self._read_doc_from_s3(self._get_full_key_path(docs))
                     if group_doc.empty:
                         continue
                     data = group_doc.query(f"{self.key} == '{doc[self.key]}'")
-                    data = data.to_dict(orient="index")[0]
+                    data = data.to_dict(orient="index").values()
+
                 if properties is None:
-                    yield data
+                    yield from data
                 else:
-                    yield {p: data[p] for p in prop_keys if p in data}
+                    yield from [{p: item[p] for p in prop_keys if p in item} for item in data]
 
     def _read_doc_from_s3(self, file_id: str) -> pd.DataFrame:
         try:
             response = self.s3_bucket.Object(file_id).get()
-            return pd.read_json(response["Body"], orient="records", lines=True, compression={"method": "gzip"})
+            df = pd.read_json(response["Body"], orient="records", lines=True, compression={"method": "gzip"})
+
+            def replace_nested_date_dict(obj):
+                if isinstance(obj, dict):
+                    if "$date" in obj:
+                        # Return the datetime string or convert it to a datetime object
+                        return datetime.fromisoformat(obj["$date"].rstrip("Z"))
+                    else:
+                        # Recursively process each key-value pair in the dictionary
+                        for key, value in obj.items():
+                            obj[key] = replace_nested_date_dict(value)
+                elif isinstance(obj, list):
+                    # Process each item in the list
+                    return [replace_nested_date_dict(item) for item in obj]
+                return obj
+
+            df = df.applymap(replace_nested_date_dict)
+
+            return df
         except ClientError as ex:
             if ex.response["Error"]["Code"] == "NoSuchKey":
                 return pd.DataFrame()
@@ -602,6 +631,14 @@ class OpenDataStore(S3Store):
         if additional_metadata is not None:
             raise NotImplementedError("updating store with additional metadata is not supported")
         super().update(docs=docs, key=key)
+
+        temp_index = pd.DataFrame(docs, columns=[self.key, "last_updated", "nelements"])
+
+        sym = pd.Series([num["symmetry"]["number"] for num in docs], copy=False)
+
+        temp_index["symmetry_number"] = sym
+
+        return temp_index
 
     @staticmethod
     def json_normalize_and_filter(docs: List[Dict], object_grouping: List[str]) -> pd.DataFrame:
